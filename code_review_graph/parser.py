@@ -1546,6 +1546,30 @@ _TS_TYPE_DECLARATIONS = frozenset({
     "type_alias_declaration", "enum_declaration",
 })
 
+# C# declarations that spell a type in a signature position, mapped to the
+# field holding it. ``params Order[] rest`` parses as a ``type`` field of the
+# ``parameter_list`` itself, so that list is a slot too. A field or an event
+# field keeps its type on the ``variable_declaration`` child.
+_CSHARP_TYPE_SLOTS = {
+    "method_declaration": "returns",
+    "parameter": "type",
+    "parameter_list": "type",
+    "property_declaration": "type",
+    "indexer_declaration": "type",
+    "event_declaration": "type",
+    "delegate_declaration": "type",
+    "operator_declaration": "type",
+    "conversion_operator_declaration": "type",
+    "local_function_statement": "type",
+    "field_declaration": "type",
+    "event_field_declaration": "type",
+}
+
+# C# type syntax that wraps one inner type (``Order[]``, ``Order?``, ``ref Order``).
+_CSHARP_TYPE_WRAPPERS = frozenset({
+    "array_type", "nullable_type", "ref_type", "pointer_type", "scoped_type",
+})
+
 _FUNCTION_TYPES: dict[str, list[str]] = {
     "python": ["function_definition"],
     "javascript": [
@@ -3012,6 +3036,39 @@ def _csharp_name(node) -> str:
         else:
             parts.append(current.text.decode("utf-8", errors="replace").removeprefix("@"))
     return "".join(parts)
+
+
+def _csharp_type_names(node) -> list:
+    """Name-bearing nodes inside a C# type, outermost first, in source order.
+
+    ``Dictionary<string, List<Order>>`` yields the dictionary, the list and
+    ``Order``. Predefined types, ``var`` and function pointers yield nothing.
+    """
+    found: list = []
+    pending = [node]
+    while pending:
+        current = pending.pop()
+        kind = current.type
+        if kind in ("identifier", "qualified_name", "alias_qualified_name", "generic_name"):
+            found.append(current)
+            # Type arguments may sit anywhere in a dotted name (``A.B<C>.D``).
+            inner = [current]
+            while inner:
+                part = inner.pop()
+                if part.type == "type_argument_list":
+                    pending.extend(reversed(part.named_children))
+                elif part.type in ("qualified_name", "generic_name"):
+                    inner.extend(part.named_children)
+        elif kind in _CSHARP_TYPE_WRAPPERS:
+            inner_type = current.child_by_field_name("type")
+            if inner_type is not None:
+                pending.append(inner_type)
+        elif kind == "tuple_type":
+            pending.extend(
+                t for e in reversed(current.named_children)
+                if (t := e.child_by_field_name("type")) is not None
+            )
+    return found
 
 
 def _csharp_namespace_context(node) -> list[tuple[str, int]]:
@@ -12580,6 +12637,12 @@ class CodeParser:
                     import_map, defined_names,
                 )
 
+            # --- C# type-position references ---
+            if language == "csharp" and node_type in _CSHARP_TYPE_SLOTS:
+                self._extract_csharp_type_references(
+                    child, file_path, edges, enclosing_class, enclosing_func,
+                )
+
             # --- Value references (function-as-value in maps, arrays, args) ---
             self._extract_value_references(
                 child, node_type, source, language, file_path, edges,
@@ -17130,6 +17193,12 @@ class CodeParser:
             line=child.start_point[0] + 1,
         ))
 
+        # A method's own return type; its parameters are found by the walk below.
+        if language == "csharp" and child.type == "method_declaration":
+            self._extract_csharp_type_references(
+                child, file_path, edges, enclosing_class, identity_name,
+            )
+
         # Qualified Julia methods extend a foreign module while remaining
         # structurally contained by their lexical module.
         if julia_qualifier:
@@ -19086,6 +19155,89 @@ class CodeParser:
             import_map or {}, defined_names or set(),
             line=child.start_point[0] + 1,
         )
+
+    def _extract_csharp_type_references(
+        self,
+        declaration,
+        file_path: str,
+        edges: list[EdgeInfo],
+        enclosing_class: Optional[str],
+        enclosing_func: Optional[str],
+    ) -> None:
+        """Emit ``REFERENCES`` edges for the types a C# declaration names.
+
+        Covers parameter, return, field, property, indexer, event, delegate and
+        operator types, with the type arguments, array and nullable element
+        types inside them. Base lists, ``new T()``, attributes, casts and local
+        variables are other constructs and emit nothing here.
+
+        The type is written as source spells it (``Box<Order>``, ``A::B``) and
+        left for ``csharp_resolver`` to bind: the declaring file is usually not
+        this one, and a name alone cannot say which namespace it means.
+        Predefined types, ``dynamic`` and the enclosing type parameters name no
+        declaration, so they are dropped here.
+        """
+        if declaration.type in ("parameter", "parameter_list"):
+            # A lambda's typed parameters are local code, not a signature.
+            owner = declaration.parent
+            if declaration.type == "parameter" and owner is not None:
+                owner = owner.parent
+            if owner is not None and owner.type in (
+                "lambda_expression", "anonymous_method_expression",
+            ):
+                return
+        slot = declaration
+        if declaration.type in ("field_declaration", "event_field_declaration"):
+            slot = next(
+                (c for c in declaration.children if c.type == "variable_declaration"),
+                None,
+            )
+        type_node = (
+            slot.child_by_field_name(_CSHARP_TYPE_SLOTS[declaration.type])
+            if slot is not None else None
+        )
+        if type_node is None:
+            return
+
+        generic_parameters: set[str] = set()
+        ancestor = declaration
+        while ancestor is not None:
+            for sub in ancestor.children:
+                if sub.type == "type_parameter_list":
+                    generic_parameters.update(
+                        _csharp_name(name) for p in sub.named_children
+                        if p.type == "type_parameter"
+                        for name in p.named_children if name.type == "identifier"
+                    )
+            ancestor = ancestor.parent
+
+        if enclosing_func:
+            caller = self._qualify(enclosing_func, file_path, enclosing_class)
+        elif enclosing_class:
+            caller = self._qualify(enclosing_class, file_path, None)
+        else:
+            caller = file_path
+        scopes = _csharp_namespace_context(declaration)
+        line = declaration.start_point[0] + 1
+        seen: set[str] = set()
+        for named in _csharp_type_names(type_node):
+            raw = _csharp_name(named)
+            if raw in seen or raw in generic_parameters or raw == "dynamic":
+                continue
+            seen.add(raw)
+            edges.append(EdgeInfo(
+                kind="REFERENCES",
+                source=caller,
+                target=raw,
+                file_path=file_path,
+                line=line,
+                extra={
+                    "csharp_raw_target": raw,
+                    "csharp_scopes": scopes,
+                    "csharp_containing_type": enclosing_class,
+                    "unresolved_targets": [],
+                },
+            ))
 
     def _extract_value_references(
         self,

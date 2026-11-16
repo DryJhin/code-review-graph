@@ -173,7 +173,7 @@ names the class the call went through. Both are `INFERRED`.
 | IMPLEMENTS | implementing class -> interface | |
 | CONTAINS | file -> class or function; class -> method | Structural containment |
 | TESTED_BY | function -> test function | |
-| REFERENCES | node -> symbol used as a value | Callback maps, arrays, assignment |
+| REFERENCES | node -> symbol used as a value or, in TypeScript and C#, as a type | Callback maps, arrays, assignment; type annotations; C# parameter, return, field and property types |
 | DEPENDS_ON | general dependency | Ansible role `meta` dependencies, Solidity `using` directives |
 | INJECTS | Spring bean -> injected field or constructor parameter type | Spring enrichment |
 | CONSUMES | `@KafkaListener` / `@KafkaHandler` method -> `kafka:<topic>` | Spring Kafka enrichment |

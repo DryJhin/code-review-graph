@@ -238,6 +238,21 @@ update parses no files; successful full flow replacement clears it atomically.
 This reuses the existing full trace until the binder can provide a complete
 affected set for incremental tracing.
 
+C# members also reference the types in their signatures. A parameter, return,
+field, property, indexer, event, delegate or operator type, and the type arguments,
+array and nullable element types inside it, give a `REFERENCES` edge from the member
+(or from the enclosing type, for fields, properties and the other declarations that
+are not nodes). Predefined types, `dynamic` and the enclosing type parameters are
+skipped. Base lists (`INHERITS`), `new T()` (a constructor call), attributes, casts,
+`typeof`, local variables and patterns emit no `REFERENCES`. The edge keeps the type as
+written in `csharp_raw_target` and binds through the same type lookup as a constructor
+call, so namespaces, usings, aliases, nested types, generic arity and project-owned
+global usings apply. A type that names no declaration (`System.Uri`, `List<Order>`) or
+more than one (two namespaces both imported, a partial type declared in several files)
+keeps the written name as its target and `unresolved_targets`, like an unbound call.
+Rebinding, and the raw restore before a target file is deleted, treat these edges like
+calls. They do not touch `TESTED_BY` mirrors or flows, which only follow `CALLS`.
+
 `CSHARP_IDENTITY_VERSION = "5"` upgrades the old namespace-free format, the
 nested-type-only format proposed in #937, and graphs lacking per-call lexical
 context, static/callable evidence, or generic arity. Incremental updates reparse existing C# files

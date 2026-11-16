@@ -1,8 +1,11 @@
-"""Bind C# calls using declaration identity and lexical namespace evidence.
+"""Bind C# calls and type references using declaration identity and lexical namespace evidence.
 
 Raw references survive binding: every pass can revoke a previously inferred
 edge when declarations or usings change. This is a structural binder, not a
 C# compiler; unsupported type expressions and ambiguous declarations stay raw.
+A ``REFERENCES`` edge (a type named in a signature) binds through the same type
+lookup as a constructor call, and stays on the written name when it binds to
+nothing or to more than one declaration.
 """
 
 from __future__ import annotations
@@ -354,6 +357,22 @@ def resolve_csharp_calls(store: GraphStore, repo_root: Path | None = None) -> di
                 return []
         return []
 
+    lookups: dict[tuple, list[str]] = {}
+
+    def reference_targets(row, extra: dict) -> list[str]:
+        scopes = extra.get("csharp_scopes")
+        if not scopes:
+            return []
+        owner = extra.get("csharp_containing_type") or parents.get(
+            row["source_qualified"], scopes[0][0],
+        )
+        # Signatures repeat the same few types, so a file's lookups are shared.
+        key = (extra["csharp_raw_target"], owner, row["file_path"],
+               tuple(tuple(scope) for scope in scopes))
+        if key not in lookups:
+            lookups[key] = type_targets(key[0], owner, scopes, row["file_path"])
+        return lookups[key]
+
     resolved = 0
     changed = False
     with _binding_transaction(store):
@@ -375,20 +394,46 @@ def resolve_csharp_calls(store: GraphStore, repo_root: Path | None = None) -> di
             if _set_call(store, row, target, extra):
                 resolved += len(candidates) == 1
                 changed = True
+        for row in conn.execute(
+            f"SELECT * FROM edges WHERE kind = 'REFERENCES' AND file_path IN ({csharp_files_sql})",
+        ).fetchall():
+            extra = _extra(row["extra"])
+            raw = extra.get("csharp_raw_target")
+            if row["file_path"] not in files or not isinstance(raw, str):
+                continue
+            candidates = reference_targets(row, extra)
+            # A type that names no declaration, or several, stays as written.
+            target = candidates[0] if len(candidates) == 1 else raw
+            for key in ("unresolved_targets", "scoped_resolved", "scoped_via"):
+                extra.pop(key, None)
+            if len(candidates) == 1:
+                extra.update(scoped_resolved=True, scoped_via="csharp_namespace")
+            else:
+                extra["unresolved_targets"] = []
+            changed = _write_binding(store, row, target, extra) is not None or changed
     if changed:
         store._invalidate_cache()
     return {"files_indexed": len(files), "calls_resolved": resolved}
 
 
-def _set_call(store: GraphStore, row, target: str, extra: dict) -> bool:
+def _write_binding(store: GraphStore, row, target: str, extra: dict) -> tuple[str, str] | None:
+    """Store an edge's binding; ``(serialized extra, tier)``, or ``None`` if unchanged."""
     if target == row["target_qualified"] and extra == _extra(row["extra"]):
-        return False
+        return None
     serialized = json.dumps(extra, sort_keys=True)
     tier = "INFERRED" if extra.get("scoped_resolved") else "EXTRACTED"
     store._conn.execute(
         "UPDATE edges SET target_qualified = ?, extra = ?, confidence_tier = ? WHERE id = ?",
         (target, serialized, tier, row["id"]),
     )
+    return serialized, tier
+
+
+def _set_call(store: GraphStore, row, target: str, extra: dict) -> bool:
+    written = _write_binding(store, row, target, extra)
+    if written is None:
+        return False
+    serialized, tier = written
     # Match old endpoint and evidence: two calls on one line can have mirrors.
     store._conn.execute(
         "UPDATE edges SET source_qualified = ?, extra = ?, confidence_tier = ? "
@@ -407,14 +452,14 @@ def _set_call(store: GraphStore, row, target: str, extra: dict) -> bool:
 
 
 def restore_csharp_references(store: GraphStore, deleted_files: list[str]) -> None:
-    """Restore raw incoming calls before permanent deletion removes their targets."""
+    """Restore raw incoming calls and references before deletion removes their targets."""
     if not deleted_files:
         return
     deleted = set(deleted_files)
     rows = store._conn.execute(
         "SELECT e.*, n.file_path AS target_file FROM edges e "
         "JOIN nodes n ON e.target_qualified = n.qualified_name "
-        "WHERE e.kind = 'CALLS' AND n.language = 'csharp'",
+        "WHERE e.kind IN ('CALLS', 'REFERENCES') AND n.language = 'csharp'",
     ).fetchall()
     changed = False
     with _binding_transaction(store):
@@ -426,6 +471,9 @@ def restore_csharp_references(store: GraphStore, deleted_files: list[str]) -> No
             extra.pop("scoped_resolved", None)
             extra.pop("scoped_via", None)
             extra["unresolved_targets"] = []
-            changed = _set_call(store, row, raw, extra) or changed
+            if row["kind"] == "REFERENCES":
+                changed = _write_binding(store, row, raw, extra) is not None or changed
+            else:
+                changed = _set_call(store, row, raw, extra) or changed
     if changed:
         store._invalidate_cache()

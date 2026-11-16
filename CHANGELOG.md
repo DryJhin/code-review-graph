@@ -4,6 +4,16 @@
 
 ### Added
 
+- C# members now reference the types in their signatures. A method, constructor,
+  field, property, indexer, event or delegate that takes, returns or holds a type
+  (including `List<Order>`, `Order[]` and `Order?`) gets a `REFERENCES` edge to it,
+  resolved across files by namespace, `using`, alias, nested type and generic
+  arity. `query_graph_tool` `references_to` on a C# class or interface now lists
+  the code that uses it, and a file that only uses a type shows up in impact
+  analysis and is no longer missed when the type changes. A type the graph cannot
+  pin to exactly one declaration (an external type such as `System.Uri`, or two
+  same-named types in imported namespaces) stays unbound rather than guessed.
+  Rebuild the graph to add the edges to files that have not changed.
 - `install` keeps a record of the files it writes inside the repository, in
   `.code-review-graph/install-manifest.json`, even when `--data-dir` or
   `CRG_DATA_DIR` keeps the graph somewhere else. Each install adds to it and
